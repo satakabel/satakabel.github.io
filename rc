@@ -1,0 +1,579 @@
+import time
+import socket
+import network
+import stamp
+
+from m5stack import *
+from m5ui import *
+
+def wait_ms(ms):
+    try:
+        time.sleep_ms(ms)
+    except:
+        time.sleep(ms / 1000)
+
+try:
+    ticks_ms = time.ticks_ms
+    ticks_diff = time.ticks_diff
+except:
+    def ticks_ms():
+        return int(time.time() * 1000)
+    def ticks_diff(a, b):
+        return a - b
+
+# =====================================================================
+# DISPLAY
+# =====================================================================
+setScreenColor(0x000000)
+
+try:
+    img = M5Img(0, 0, "/flash/res/saus.jpg", True)
+except:
+    print("JPG niet gevonden")
+
+# =====================================================================
+# KANAALMAPPING
+# =====================================================================
+CH_LEFT   = 0
+CH_SENSOR = 1
+CH_LED    = 2
+CH_RIGHT  = 3
+CH_SW1    = 4
+
+# =====================================================================
+# INSTELLINGEN
+# =====================================================================
+SERVO_STOP = 90
+
+# vooruit
+BASE_LEFT  = 130
+BASE_RIGHT = 50
+
+# achteruit
+BACKWARD_LEFT  = 50
+BACKWARD_RIGHT = 130
+
+# bochtsterkte handmatig
+TURN_STEP = 25
+
+# auto line-follow
+TURN_LEFT_STRONG  = (140, 60)
+TURN_RIGHT_STRONG = (120, 80)
+
+TURN_LEFT_SEARCH  = (140, -140)
+TURN_RIGHT_SEARCH = (-140, 140)
+
+limit_low  = 210
+limit_high = 225
+
+# wifi
+WIFI_SSID = "AIVD"
+WIFI_PASS = "jemoeder"
+PORT = 8080
+
+# status
+running = False
+mode = "MANUAL"
+manual_cmd = "STOP"
+
+lastSw1 = False
+lastBlink = 0
+ledState = False
+sensor_value = 0
+
+# =====================================================================
+# INIT
+# =====================================================================
+kart = stamp.get(stamp.EXT_IO, (0, 26))
+kart.init_i2c_address(0x45)
+
+kart.set_config_mode(CH_LEFT, 3)
+kart.set_config_mode(CH_SENSOR, 2)
+kart.set_config_mode(CH_LED, 1)
+kart.set_config_mode(CH_RIGHT, 3)
+kart.set_config_mode(CH_SW1, 0)
+
+# =====================================================================
+# BASISFUNCTIES
+# =====================================================================
+def clamp(angle):
+    return max(0, min(180, int(angle)))
+
+def set_motors(left_angle, right_angle):
+    kart.write_servo_angle(CH_LEFT, clamp(left_angle))
+    kart.write_servo_angle(CH_RIGHT, clamp(right_angle))
+
+def stop():
+    set_motors(SERVO_STOP, SERVO_STOP)
+
+def drive_forward():
+    set_motors(BASE_LEFT, BASE_RIGHT)
+
+def drive_backward():
+    set_motors(BACKWARD_LEFT, BACKWARD_RIGHT)
+
+def set_led(v):
+    kart.write_output_pin(CH_LED, 1 if v else 0)
+
+def toggle_led_blink(interval_ms):
+    global lastBlink, ledState
+    now = ticks_ms()
+    if ticks_diff(now, lastBlink) > interval_ms:
+        ledState = not ledState
+        set_led(ledState)
+        lastBlink = now
+
+def button_pressed():
+    global lastSw1
+    state = kart.read_input_pin(CH_SW1)
+
+    if state and not lastSw1:
+        lastSw1 = True
+        wait_ms(120)
+        return True
+    elif not state:
+        lastSw1 = False
+
+    return False
+
+# =====================================================================
+# WIFI
+# =====================================================================
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+
+    if not wlan.isconnected():
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        while not wlan.isconnected():
+            wait_ms(100)
+
+    return wlan
+
+def url_decode(s):
+    s = s.replace("+", " ")
+    parts = s.split("%")
+    if len(parts) == 1:
+        return s
+
+    out = parts[0]
+    for p in parts[1:]:
+        try:
+            out += chr(int(p[:2], 16)) + p[2:]
+        except:
+            out += "%" + p
+    return out
+
+def get_query_param(path, name, default=""):
+    if "?" not in path:
+        return default
+
+    query = path.split("?", 1)[1]
+    pairs = query.split("&")
+
+    for pair in pairs:
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            if k == name:
+                return url_decode(v)
+
+    return default
+
+# =====================================================================
+# WEBPAGINA
+# =====================================================================
+def html_page():
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>M5 Kart AUTO / WASD</title>
+<style>
+body{
+    margin:0;
+    background:#111;
+    color:#fff;
+    font-family:Arial,sans-serif;
+    text-align:center;
+    padding:20px;
+}
+.wrap{
+    max-width:760px;
+    margin:0 auto;
+}
+.card{
+    background:#1d1d1d;
+    border-radius:16px;
+    padding:16px;
+    margin-bottom:16px;
+}
+.key{
+    display:inline-block;
+    min-width:72px;
+    padding:18px 12px;
+    margin:6px;
+    border-radius:14px;
+    background:#333;
+    font-size:28px;
+    font-weight:bold;
+    user-select:none;
+}
+.active{
+    background:#2d7cff;
+}
+button{
+    border:0;
+    border-radius:12px;
+    padding:14px 18px;
+    margin:6px;
+    font-size:16px;
+    cursor:pointer;
+}
+.primary{ background:#2d7cff; color:#fff; }
+.stopbtn{ background:#d32f2f; color:#fff; }
+.small{ color:#bbb; }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <h2>M5 Kart besturing</h2>
+        <p>Klik 1 keer op deze pagina en gebruik daarna WASD.</p>
+        <p><b>W</b> = vooruit</p>
+        <p><b>A</b> = links om eigen as</p>
+        <p><b>D</b> = rechts om eigen as</p>
+        <p><b>S</b> = achteruit</p>
+        <p><b>W + A</b> = naar voren links</p>
+        <p><b>W + D</b> = naar voren rechts</p>
+    </div>
+
+    <div class="card">
+        <button class="primary" onclick="toggleRun()">Start / Stop</button>
+        <button class="primary" onclick="setMode('MANUAL')">MANUAL</button>
+        <button class="primary" onclick="setMode('AUTO')">AUTO</button>
+        <button class="stopbtn" onclick="sendCmd('STOP', true)">NOODSTOP</button>
+    </div>
+
+    <div class="card">
+        <div><span id="w" class="key">W</span></div>
+        <div>
+            <span id="a" class="key">A</span>
+            <span id="s" class="key">S</span>
+            <span id="d" class="key">D</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <p id="status">Verbinden...</p>
+        <p class="small">AUTO = line-follow, MANUAL = wifi toetsenbord</p>
+    </div>
+</div>
+
+<script>
+let keys = {w:false,a:false,s:false,d:false};
+let lastCmd = "";
+
+function cmdFromKeys() {
+    if (keys.w && keys.a) return "FORWARD_LEFT";
+    if (keys.w && keys.d) return "FORWARD_RIGHT";
+    if (keys.s && keys.a) return "BACK_LEFT";
+    if (keys.s && keys.d) return "BACK_RIGHT";
+    if (keys.w) return "FORWARD";
+    if (keys.s) return "BACKWARD";
+    if (keys.a) return "LEFT";
+    if (keys.d) return "RIGHT";
+    return "STOP";
+}
+
+function sendCmd(cmd, force) {
+    if (!force && cmd === lastCmd) return;
+    lastCmd = cmd;
+    fetch("/api/cmd?set=" + cmd, {cache:"no-store"}).catch(()=>{});
+}
+
+function setMode(mode) {
+    fetch("/api/mode?set=" + mode, {cache:"no-store"}).then(()=>refreshStatus()).catch(()=>{});
+}
+
+function toggleRun() {
+    fetch("/api/toggle_run", {cache:"no-store"}).then(()=>refreshStatus()).catch(()=>{});
+}
+
+function draw() {
+    document.getElementById("w").className = "key" + (keys.w ? " active" : "");
+    document.getElementById("a").className = "key" + (keys.a ? " active" : "");
+    document.getElementById("s").className = "key" + (keys.s ? " active" : "");
+    document.getElementById("d").className = "key" + (keys.d ? " active" : "");
+}
+
+window.addEventListener("keydown", function(e){
+    const k = e.key.toLowerCase();
+    if (k === "w" || k === "a" || k === "s" || k === "d") {
+        if (!keys[k]) {
+            keys[k] = true;
+            draw();
+            sendCmd(cmdFromKeys(), false);
+        }
+        e.preventDefault();
+    }
+});
+
+window.addEventListener("keyup", function(e){
+    const k = e.key.toLowerCase();
+    if (k === "w" || k === "a" || k === "s" || k === "d") {
+        if (keys[k]) {
+            keys[k] = false;
+            draw();
+            sendCmd(cmdFromKeys(), false);
+        }
+        e.preventDefault();
+    }
+});
+
+window.addEventListener("blur", function(){
+    keys.w = false;
+    keys.a = false;
+    keys.s = false;
+    keys.d = false;
+    draw();
+    sendCmd("STOP", true);
+});
+
+function refreshStatus() {
+    fetch("/api/status", {cache:"no-store"})
+        .then(r => r.json())
+        .then(s => {
+            document.getElementById("status").textContent =
+                "running=" + s.running +
+                " mode=" + s.mode +
+                " sensor=" + s.sensor +
+                " cmd=" + s.cmd;
+        })
+        .catch(() => {
+            document.getElementById("status").textContent = "Verbinding mislukt";
+        });
+}
+
+window.addEventListener("load", function(){
+    draw();
+    sendCmd("STOP", true);
+    refreshStatus();
+});
+
+setInterval(refreshStatus, 1000);
+</script>
+</body>
+</html>"""
+
+# =====================================================================
+# HTTP
+# =====================================================================
+def parse_path(req):
+    try:
+        return req.split(" ")[1]
+    except:
+        return "/"
+
+def http_send(client, body, ctype):
+    client.send((
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: " + ctype + "\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-store\r\n\r\n"
+    ).encode())
+    client.send(body.encode())
+
+def start_server():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.settimeout(0.001)
+    except:
+        pass
+    s.bind(("0.0.0.0", PORT))
+    s.listen(1)
+    return s
+
+def handle_api(path):
+    global running, mode, manual_cmd
+
+    if path.startswith("/api/toggle_run"):
+        running = not running
+        return '{"ok":true,"running":%s}' % ("true" if running else "false")
+
+    elif path.startswith("/api/mode"):
+        value = get_query_param(path, "set", "MANUAL")
+        if value == "AUTO":
+            mode = "AUTO"
+        else:
+            mode = "MANUAL"
+        return '{"ok":true,"mode":"%s"}' % mode
+
+    elif path.startswith("/api/cmd"):
+        value = get_query_param(path, "set", "STOP")
+        if value in (
+            "FORWARD", "BACKWARD", "LEFT", "RIGHT",
+            "FORWARD_LEFT", "FORWARD_RIGHT",
+            "BACK_LEFT", "BACK_RIGHT",
+            "STOP"
+        ):
+            manual_cmd = value
+        else:
+            manual_cmd = "STOP"
+        return '{"ok":true,"cmd":"%s"}' % manual_cmd
+
+    elif path.startswith("/api/status"):
+        return '{"running":%s,"mode":"%s","sensor":%d,"cmd":"%s"}' % (
+            "true" if running else "false",
+            mode,
+            sensor_value,
+            manual_cmd
+        )
+
+    return '{"ok":false}'
+
+def poll_server(server):
+    try:
+        cl, addr = server.accept()
+    except:
+        return
+
+    try:
+        try:
+            cl.settimeout(0.001)
+        except:
+            pass
+
+        req = cl.recv(512).decode()
+        path = parse_path(req)
+
+        if path.startswith("/api/"):
+            body = handle_api(path)
+            http_send(cl, body, "application/json")
+        else:
+            http_send(cl, html_page(), "text/html")
+    except Exception as e:
+        print("HTTP fout:", e)
+
+    try:
+        cl.close()
+    except:
+        pass
+
+# =====================================================================
+# MANUAL BESTURING
+# =====================================================================
+def update_manual():
+    # W = vooruit
+    if manual_cmd == "FORWARD":
+        set_motors(BASE_LEFT, BASE_RIGHT)
+        set_led(True)
+
+    # S = achteruit
+    elif manual_cmd == "BACKWARD":
+        set_motors(BACKWARD_LEFT, BACKWARD_RIGHT)
+        set_led(True)
+
+    # A = links om eigen as
+    elif manual_cmd == "LEFT":
+        set_motors(BACKWARD_LEFT, BASE_RIGHT)
+        set_led(True)
+
+    # D = rechts om eigen as
+    elif manual_cmd == "RIGHT":
+        set_motors(BASE_LEFT, BACKWARD_RIGHT)
+        set_led(True)
+
+    # W + A = vooruit links
+    elif manual_cmd == "FORWARD_LEFT":
+        set_motors(BASE_LEFT - TURN_STEP, BASE_RIGHT)
+        set_led(True)
+
+    # W + D = vooruit rechts
+    elif manual_cmd == "FORWARD_RIGHT":
+        set_motors(BASE_LEFT, BASE_RIGHT + TURN_STEP)
+        set_led(True)
+
+    # S + A = achteruit links
+    elif manual_cmd == "BACK_LEFT":
+        set_motors(BACKWARD_LEFT, BACKWARD_RIGHT - TURN_STEP)
+        set_led(True)
+
+    # S + D = achteruit rechts
+    elif manual_cmd == "BACK_RIGHT":
+        set_motors(BACKWARD_LEFT + TURN_STEP, BACKWARD_RIGHT)
+        set_led(True)
+
+    else:
+        stop()
+        set_led(False)
+
+# =====================================================================
+# AUTO LINE-FOLLOW (OMGEKEERD)
+# zwart = rechtdoor
+# wit = sturen + LED knipper
+# =====================================================================
+def follow_line_inverted(sensor):
+    if limit_low <= sensor <= limit_high:
+        drive_forward()
+        set_led(False)
+
+    elif sensor < limit_low:
+        set_motors(TURN_RIGHT_SEARCH[0], TURN_RIGHT_STRONG[1])
+        toggle_led_blink(120)
+        wait_ms(100)
+
+        set_motors(TURN_LEFT_SEARCH[0], TURN_LEFT_STRONG[1])
+        toggle_led_blink(120)
+        wait_ms(200)
+
+    else:
+        set_motors(TURN_LEFT_STRONG[0], TURN_LEFT_STRONG[1])
+        toggle_led_blink(120)
+
+# =====================================================================
+# START
+# =====================================================================
+stop()
+set_led(False)
+
+print("druk knop om te starten")
+print("modus:", mode)
+
+wlan = connect_wifi()
+ip = wlan.ifconfig()[0]
+print("Open: http://" + ip + ":" + str(PORT) + "/")
+
+try:
+    M5TextBox(10, 10, "IP: " + ip + ":" + str(PORT), lcd.FONT_Default, 0xFFFFFF, rotate=0)
+except:
+    pass
+
+server = start_server()
+
+# =====================================================================
+# LOOP
+# =====================================================================
+while True:
+    poll_server(server)
+
+    if button_pressed():
+        running = not running
+        print("RUNNING =", running)
+
+        if not running:
+            stop()
+            set_led(False)
+
+    if running:
+        if mode == "AUTO":
+            sensor_value = kart.read_adc8_pin(CH_SENSOR)
+            follow_line_inverted(sensor_value)
+        else:
+            update_manual()
+    else:
+        stop()
+        set_led(False)
+
+    wait_ms(5)
